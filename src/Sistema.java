@@ -1,3 +1,4 @@
+package src;
 // PUCRS - Escola Politécnica - Sistemas Operacionais
 // Prof. Fernando Dotti
 // Código fornecido como parte da solução do projeto de Sistemas Operacionais
@@ -99,6 +100,7 @@ public class Sistema {
 		                            // auxilio aa depuração
 		private boolean debug;      // se true entao mostra cada instrucao em execucao
 		private Utilities u;        // para debug (dump)
+		
 
 		public CPU(Memory _mem, boolean _debug) { // ref a MEMORIA passada na criacao da CPU
 			maxInt = 32767;            // capacidade de representacao modelada
@@ -109,6 +111,54 @@ public class Sistema {
 			debug = _debug;            // se true, print da instrucao em execucao
 
 		}
+
+		private int tamPg() { return u.hw.gm.getTamPg(); } // usa GM
+		private int traduz(int enderecoLogico) {
+			// Sem tabela ativa: endereço lógico==físico (modo legado)
+			if (u.hw.tabelaPaginasAtiva == null) return enderecoLogico;
+
+			int pagina = enderecoLogico / tamPg();
+			int desloc = enderecoLogico % tamPg();
+			if (pagina < 0 || pagina >= u.hw.tabelaPaginasAtiva.length) {
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			int frame = u.hw.tabelaPaginasAtiva[pagina];
+			if (frame < 0 || frame >= u.hw.gm.getNumFrames()) {
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			int enderecoFisico = frame * tamPg() + desloc;
+			if (enderecoFisico < 0 || enderecoFisico >= m.length) {
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			return enderecoFisico;
+		}
+		public int readMemLogicaP(int e) {
+		Word w = lerMemLogica(e);   // usa MMU
+		return (w != null) ? w.p : 0;
+		}
+
+
+		private boolean legalLogico(int e) {
+			int ef = traduz(e);
+			return (ef >= 0); // traduz seta intEnderecoInvalido se ruim
+		}
+
+		private Word lerMemLogica(int e) {
+			int ef = traduz(e);
+			if (ef < 0) return null;
+			return m[ef];
+		}
+		private void escreverMemLogica(int e, int valor) {
+			int ef = traduz(e);
+			if (ef < 0) return;
+			m[ef].opc = Opcode.DATA;
+			m[ef].p   = valor;
+		}
+		// --- FIM MMU/Tradução ---
+
 
 		public void setAddressOfHandlers(InterruptHandling _ih, SysCallHandling _sysCall) {
 			ih = _ih;                  // aponta para rotinas de tratamento de int
@@ -153,8 +203,8 @@ public class Sistema {
 
 				// --------------------------------------------------------------------------------------------------
 				// FASE DE FETCH
-				if (legal(pc)) { // pc valido
-					ir = m[pc];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
+				if (legalLogico(pc)) {
+    			ir = lerMemLogica(pc); // busca via tradução
 					             // resto é dump de debug
 					if (debug) {
 						System.out.print("                                              regs: ");
@@ -179,21 +229,20 @@ public class Sistema {
 							pc++;
 							break;
 						case LDD: // Rd <- [A]
-							if (legal(ir.p)) {
-								reg[ir.ra] = m[ir.p].p;
-								pc++;
+							if (legalLogico(ir.p)) {
+								 reg[ir.ra] = lerMemLogica(ir.p).p;
+								  pc++;
 							}
 							break;
 						case LDX: // RD <- [RS] // NOVA
-							if (legal(reg[ir.rb])) {
-								reg[ir.ra] = m[reg[ir.rb]].p;
-								pc++;
+							if (legalLogico(reg[ir.rb])) {
+								 reg[ir.ra] = lerMemLogica(reg[ir.rb]).p;
+								  pc++;
 							}
 							break;
 						case STD: // [A] ← Rs
-							if (legal(ir.p)) {
-								m[ir.p].opc = Opcode.DATA;
-								m[ir.p].p = reg[ir.ra];
+							if (legalLogico(ir.p)) {
+								escreverMemLogica(ir.p, reg[ir.ra]);
 								pc++;
                                 if (debug) 
 								    {   System.out.print("                                  ");   
@@ -202,11 +251,11 @@ public class Sistema {
 								}
 							break;
 						case STX: // [Rd] ←Rs
-							if (legal(reg[ir.ra])) {
-								m[reg[ir.ra]].opc = Opcode.DATA;
-								m[reg[ir.ra]].p = reg[ir.rb];
+							if (legalLogico(reg[ir.ra])) {
+								escreverMemLogica(reg[ir.ra], reg[ir.rb]);
 								pc++;
 							}
+
 							;
 							break;
 						case MOVE: // RD <- RS
@@ -245,8 +294,11 @@ public class Sistema {
 							pc = ir.p;
 							break;
 						case JMPIM: // PC <- [A]
-							      pc = m[ir.p].p;
-							break;
+						// ANTES: pc = m[ir.p].p;
+						if (legalLogico(ir.p)) {
+							pc = lerMemLogica(ir.p).p;
+						}
+						break;
 						case JMPIG: // If Rc > 0 Then PC ← Rs Else PC ← PC +1
 							if (reg[ir.rb] > 0) {
 								pc = reg[ir.ra];
@@ -290,28 +342,35 @@ public class Sistema {
 							}
 							break;
 						case JMPIGM: // If RC > 0 then PC <- [A] else PC++
-						    if (legal(ir.p)){
-							    if (reg[ir.rb] > 0) {
-								   pc = m[ir.p].p;
-							    } else {
-								  pc++;
-							   }
-						    }
-							break;
-						case JMPILM: // If RC < 0 then PC <- k else PC++
+						// ANTES: if (legal(ir.p)) { if (reg[ir.rb] > 0) pc = m[ir.p].p; else pc++; }
+						if (legalLogico(ir.p)) {
+							if (reg[ir.rb] > 0) {
+								pc = lerMemLogica(ir.p).p;
+							} else {
+								pc++;
+							}
+						}
+						break;
+						case JMPILM: // If RC < 0 then PC <- [A] else PC++
+						// ANTES: if (reg[ir.rb] < 0) { pc = m[ir.p].p; } else { pc++; }
+						if (legalLogico(ir.p)) {
 							if (reg[ir.rb] < 0) {
-								pc = m[ir.p].p;
+								pc = lerMemLogica(ir.p).p;
 							} else {
 								pc++;
 							}
-							break;
-						case JMPIEM: // If RC = 0 then PC <- k else PC++
+						}
+						break;
+						case JMPIEM: // If RC = 0 then PC <- [A] else PC++
+						// ANTES: if (reg[ir.rb] == 0) { pc = m[ir.p].p; } else { pc++; }
+						if (legalLogico(ir.p)) {
 							if (reg[ir.rb] == 0) {
-								pc = m[ir.p].p;
+								pc = lerMemLogica(ir.p).p;
 							} else {
 								pc++;
 							}
-							break;
+						}
+						break;
 						case JMPIGT: // If RS>RC then PC <- k else PC++
 							if (reg[ir.ra] > reg[ir.rb]) {
 								pc = ir.p;
@@ -357,15 +416,20 @@ public class Sistema {
 
 	// ------------------- HW - constituido de CPU e MEMORIA
 	// -----------------------------------------------
-	public class HW {
-		public Memory mem;
-		public CPU cpu;
+	class HW {
+    public Memory mem;
+    public CPU cpu;
+    public GerenteMemoria gm;       // << novo
+    public int tamPg = 4;           // << defina um default (pode vir de args)
+    public int[] tabelaPaginasAtiva; // << tabela do “processo atual” (Parte A: 1 processo)
 
-		public HW(int tamMem) {
-			mem = new Memory(tamMem);
-			cpu = new CPU(mem, true); // true liga debug
-		}
-	}
+    public HW(int tamMem) {
+        mem = new Memory(tamMem);
+        gm  = new GerenteMemoria(tamMem, tamPg);
+        cpu = new CPU(mem, true); // true liga debug
+    }
+}
+
 	// -------------------------------------------------------------------------------------------------------
 
 	// --------------------H A R D W A R E - fim
@@ -418,8 +482,10 @@ public class Sistema {
 				  // leitura ...
 
 			} else if (hw.cpu.reg[8]==2){
-				  // escrita - escreve o conteuodo da memoria na posicao dada em reg[9]
-				  System.out.println("OUT:   "+ hw.mem.pos[hw.cpu.reg[9]].p);
+				  // saída: lê endereço LÓGICO reg[9] via MMU
+				int logicalAddr = hw.cpu.reg[9];
+				int v = hw.cpu.readMemLogicaP(logicalAddr);
+				System.out.println("OUT:   " + v);
 			} else {System.out.println("  PARAMETRO INVALIDO"); }		
 		}
 	}
@@ -436,6 +502,7 @@ public class Sistema {
 			hw = _hw;
 		}
 
+		
 		private void loadProgram(Word[] p) {
 			Word[] m = hw.mem.pos; // m[] é o array de posições memória do hw
 			for (int i = 0; i < p.length; i++) {
@@ -445,6 +512,38 @@ public class Sistema {
 				m[i].p = p[i].p;
 			}
 		}
+
+	// dentro de Utilities (mesma classe do loadProgram original)
+private void loadProgramPaged(Word[] progImage) {
+    int tamProg = progImage.length;
+    int[] tabela = hw.gm.aloca(tamProg);
+    if (tabela == null) {
+        System.out.println("Sem memória (frames) para alocar programa.");
+        return;
+    }
+    hw.tabelaPaginasAtiva = tabela; // Parte A: uma única tabela “global”
+
+	System.out.println("Frames alocados: " + java.util.Arrays.toString(hw.tabelaPaginasAtiva));
+    System.out.println("tamPg = " + hw.gm.getTamPg() + "  |  páginas = " + tabela.length);
+
+    int tamPg = hw.gm.getTamPg();
+    int posLogica = 0;
+    for (int p = 0; p < tabela.length; p++) {
+        int frame = tabela[p];
+        int baseFisica = frame * tamPg;
+        for (int off = 0; off < tamPg && posLogica < tamProg; off++, posLogica++) {
+            // copia a “imagem lógica” para o frame físico correto
+            hw.mem.pos[baseFisica + off].opc = progImage[posLogica].opc;
+            hw.mem.pos[baseFisica + off].ra  = progImage[posLogica].ra;
+            hw.mem.pos[baseFisica + off].rb  = progImage[posLogica].rb;
+            hw.mem.pos[baseFisica + off].p   = progImage[posLogica].p;
+        }
+    }
+    // ponto de entrada lógico do programa é 0
+    hw.cpu.setContext(0);
+}
+
+		
 
 		// dump da memória
 		public void dump(Word w) { // funcoes de DUMP nao existem em hardware - colocadas aqui para facilidade
@@ -468,16 +567,28 @@ public class Sistema {
 			}
 		}
 
+		// private void loadAndExec(Word[] p) {
+		// 	loadProgram(p); // carga do programa na memoria
+		// 	System.out.println("---------------------------------- programa carregado na memoria");
+		// 	dump(0, p.length); // dump da memoria nestas posicoes
+		// 	hw.cpu.setContext(0); // seta pc para endereço 0 - ponto de entrada dos programas
+		// 	System.out.println("---------------------------------- inicia execucao ");
+		// 	hw.cpu.run(); // cpu roda programa ate parar
+		// 	System.out.println("---------------------------------- memoria após execucao ");
+		// 	dump(0, p.length); // dump da memoria com resultado
+		// }
+
 		private void loadAndExec(Word[] p) {
-			loadProgram(p); // carga do programa na memoria
-			System.out.println("---------------------------------- programa carregado na memoria");
-			dump(0, p.length); // dump da memoria nestas posicoes
-			hw.cpu.setContext(0); // seta pc para endereço 0 - ponto de entrada dos programas
-			System.out.println("---------------------------------- inicia execucao ");
-			hw.cpu.run(); // cpu roda programa ate parar
-			System.out.println("---------------------------------- memoria após execucao ");
-			dump(0, p.length); // dump da memoria com resultado
-		}
+		loadProgramPaged(p);                      // <<< troque para a versão paginada
+		System.out.println("---------------------------------- programa carregado na memoria");
+		// dump físico contínuo deixa de fazer sentido; pode manter só para inspeção
+		// hw.cpu.setContext(0);  // já é feito no loadProgramPaged
+		System.out.println("---------------------------------- inicia execucao ");
+		hw.cpu.run();
+		System.out.println("---------------------------------- fim da execucao ");
+}
+
+
 	}
 
 	public class SO {
