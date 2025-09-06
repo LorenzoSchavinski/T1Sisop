@@ -112,6 +112,10 @@ public class Sistema {
 
 		}
 
+		// >>>>>> INSERÇÃO MÍNIMA para traceOn/traceOff
+		public void setDebug(boolean d) { this.debug = d; }
+		// <<<<<<
+
 		private int tamPg() { return u.hw.gm.getTamPg(); } // usa GM
 		private int traduz(int enderecoLogico) {
 			// Sem tabela ativa: endereço lógico==físico (modo legado)
@@ -611,26 +615,62 @@ private void loadProgramPaged(Word[] progImage) {
 	public SO so;
 	public Programs progs;
 
+	// >>>>>> INSERÇÃO MÍNIMA: expor o GP
+	public GerenteProcessos gp;
+	// <<<<<<
+
 	public Sistema(int tamMem) {
 		hw = new HW(tamMem);           // memoria do HW tem tamMem palavras
 		so = new SO(hw);
 		hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
 		progs = new Programs();
+		// >>>>>> INSERÇÃO MÍNIMA: instanciar o GP
+		gp = new GerenteProcessos(hw, so.utils, progs);
+		// <<<<<<
 	}
 
+	// >>>>>> INSERÇÃO MÍNIMA: loop interativo exigido no PDF
 	public void run() {
-
-		so.utils.loadAndExec(progs.retrieveProgram("fatorialV2"));
-
-		// so.utils.loadAndExec(progs.retrieveProgram("fatorial"));
-		// fibonacci10,
-		// fibonacci10v2,
-		// progMinimo,
-		// fatorialWRITE, // saida
-		// fibonacciREAD, // entrada
-		// PB
-		// PC, // bubble sort
+		System.out.println("SO pronto. Comandos: new <prog> | rm <pid> | ps | dump <pid> | dumpM <ini> <fim> | exec <pid> | traceOn | traceOff | exit");
+		Scanner sc = new Scanner(System.in);
+		while (true) {
+			System.out.print("> ");
+			if (!sc.hasNext()) break;
+			String cmd = sc.next();
+			if (cmd.equalsIgnoreCase("new")) {
+				String prog = sc.next();
+				gp.newProcess(prog);
+			} else if (cmd.equalsIgnoreCase("rm")) {
+				int pid = sc.nextInt();
+				gp.rm(pid);
+			} else if (cmd.equalsIgnoreCase("ps")) {
+				gp.ps();
+			} else if (cmd.equalsIgnoreCase("dump")) {
+				int pid = sc.nextInt();
+				gp.dump(pid);
+			} else if (cmd.equalsIgnoreCase("dumpM")) {
+				int ini = sc.nextInt();
+				int fim = sc.nextInt();
+				gp.dumpM(ini, fim);
+			} else if (cmd.equalsIgnoreCase("exec")) {
+				int pid = sc.nextInt();
+				gp.exec(pid);
+			} else if (cmd.equalsIgnoreCase("traceOn")) {
+				gp.setTrace(true);
+			} else if (cmd.equalsIgnoreCase("traceOff")) {
+				gp.setTrace(false);
+			} else if (cmd.equalsIgnoreCase("exit")) {
+				System.out.println("Encerrando SO.");
+				break;
+			} else {
+				System.out.println("Comando inválido.");
+				sc.nextLine(); // limpa resto da linha
+			}
+		}
+		sc.close();
 	}
+	// <<<<<<
+
 	// ------------------- S I S T E M A - fim
 	// --------------------------------------------------------------
 	// -------------------------------------------------------------------------------------------------------
@@ -663,7 +703,7 @@ private void loadProgramPaged(Word[] progImage) {
 
 		public Word[] retrieveProgram(String pname) {
 			for (Program p : progs) {
-				if (p != null & p.name == pname)
+				if (p != null && p.name.equals(pname))
 					return p.image;
 			}
 			return null;
@@ -951,4 +991,188 @@ private void loadProgramPaged(Word[] progImage) {
 						})
 		};
 	}
+
+	// >>>>>> INSERÇÃO MÍNIMA: P R O C E S S O S (PCB + GP)
+	public enum ProcState { NEW, READY, RUNNING, TERMINATED }
+
+	public class PCB {
+		public final int pid;
+		public final String name;
+		public ProcState state;
+		public int pcLogico;          // PC lógico (para evoluções futuras)
+		public int[] tabelaPaginas;   // page -> frame
+		public int tamProg;           // número de palavras do programa
+
+		public PCB(int pid, String name, int[] tabela, int tamProg) {
+			this.pid = pid;
+			this.name = name;
+			this.tabelaPaginas = tabela;
+			this.tamProg = tamProg;
+			this.pcLogico = 0;
+			this.state = ProcState.NEW;
+		}
+	}
+
+	public class GerenteProcessos {
+		private final HW hw;
+		private final Utilities utils;
+		private final Programs progs;
+		private int nextPid = 1;
+
+		private final Map<Integer, PCB> procTable = new HashMap<>();
+		private final Deque<PCB> readyQueue = new ArrayDeque<>();
+		private PCB running = null;
+
+		public GerenteProcessos(HW hw, Utilities utils, Programs progs) {
+			this.hw = hw;
+			this.utils = utils;
+			this.progs = progs;
+		}
+
+		// new <nomeDePrograma>
+		public int newProcess(String progName) {
+			Word[] image = progs.retrieveProgram(progName);
+			if (image == null) {
+				System.out.println("Programa não encontrado: " + progName);
+				return -1;
+			}
+			int tamProg = image.length;
+
+			// O programa PC usa endereços 96..99 (chaves). Reserve espaço lógico até 100.
+			int tamLogico = Math.max(tamProg, 100);
+			int[] tabela = hw.gm.aloca(tamLogico);
+			if (tabela == null) {
+				System.out.println("Sem memória (frames) para alocar: " + progName);
+				return -1;
+			}
+
+			copyProgramToFrames(tabela, image);
+
+			int pid = nextPid++;
+			PCB pcb = new PCB(pid, progName, tabela, tamProg);
+			pcb.state = ProcState.READY;
+			procTable.put(pid, pcb);
+			readyQueue.addLast(pcb);
+
+			System.out.println("Processo criado: PID=" + pid + "  Prog=" + progName +
+					"  Pags=" + tabela.length + "  Frames=" + java.util.Arrays.toString(tabela));
+			return pid;
+		}
+
+		// rm <id>
+		public boolean rm(int pid) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) {
+				System.out.println("PID inexistente: " + pid);
+				return false;
+			}
+			if (running != null && running.pid == pid) {
+				System.out.println("PID " + pid + " está rodando; finalize antes de remover.");
+				return false;
+			}
+			readyQueue.removeIf(p -> p.pid == pid);
+			hw.gm.desaloca(pcb.tabelaPaginas);
+			procTable.remove(pid);
+			System.out.println("Processo removido: PID=" + pid + " (" + pcb.name + ")");
+			return true;
+		}
+
+		// ps
+		public void ps() {
+			if (procTable.isEmpty()) {
+				System.out.println("(sem processos)");
+				return;
+			}
+			System.out.println(String.format("%-5s %-14s %-10s %-6s %-18s", "PID", "PROGRAMA", "ESTADO", "PC", "PAGS(frames)"));
+			for (PCB p : procTable.values()) {
+				System.out.println(String.format("%-5d %-14s %-10s %-6d %s",
+						p.pid, p.name, p.state, p.pcLogico, java.util.Arrays.toString(p.tabelaPaginas)));
+			}
+			if (running != null) {
+				System.out.println("Running: PID=" + running.pid);
+			}
+			if (!readyQueue.isEmpty()) {
+				System.out.print("ReadyQueue: ");
+				readyQueue.forEach(p -> System.out.print(p.pid + " "));
+				System.out.println();
+			}
+		}
+
+		// dump <id>
+		public void dump(int pid) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) {
+				System.out.println("PID inexistente: " + pid);
+				return;
+			}
+			System.out.println("PCB { pid=" + pcb.pid + ", name=" + pcb.name + ", state=" + pcb.state +
+					", pcLogico=" + pcb.pcLogico + ", tamProg=" + pcb.tamProg + ", tabela=" +
+					java.util.Arrays.toString(pcb.tabelaPaginas) + " }");
+
+			int tamPg = hw.gm.getTamPg();
+			System.out.println("Dump memória física por frame:");
+			for (int frame : pcb.tabelaPaginas) {
+				int base = frame * tamPg;
+				System.out.println("Frame " + frame + " (físico " + base + " .. " + (base + tamPg - 1) + "):");
+				utils.dump(base, base + tamPg);
+			}
+		}
+
+		// dumpM <ini> <fim>
+		public void dumpM(int ini, int fim) {
+			utils.dump(ini, fim);
+		}
+
+		// exec <id>
+		public boolean exec(int pid) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) {
+				System.out.println("PID inexistente: " + pid);
+				return false;
+			}
+			if (running != null) {
+				System.out.println("Já existe processo rodando: PID=" + running.pid);
+				return false;
+			}
+			readyQueue.removeIf(p -> p.pid == pid);
+
+			hw.tabelaPaginasAtiva = pcb.tabelaPaginas;
+			hw.cpu.setContext(pcb.pcLogico);
+			pcb.state = ProcState.RUNNING;
+			running = pcb;
+
+			System.out.println("---------------------------------- inicia execucao PID=" + pid);
+			hw.cpu.run(); // roda até STOP ou interrupção
+			System.out.println("---------------------------------- fim da execucao PID=" + pid);
+
+			pcb.state = ProcState.TERMINATED;
+			running = null;
+			hw.tabelaPaginasAtiva = null; // desativa tabela
+			return true;
+		}
+
+		// traceOn / traceOff
+		public void setTrace(boolean on) {
+			hw.cpu.setDebug(on);
+			System.out.println("Trace " + (on ? "ON" : "OFF"));
+		}
+
+		// copia a imagem lógica do programa para os frames físicos alocados
+		private void copyProgramToFrames(int[] tabela, Word[] progImage) {
+			int tamPg = hw.gm.getTamPg();
+			int posLog = 0;
+			for (int p = 0; p < tabela.length; p++) {
+				int frame = tabela[p];
+				int baseFisica = frame * tamPg;
+				for (int off = 0; off < tamPg && posLog < progImage.length; off++, posLog++) {
+					hw.mem.pos[baseFisica + off].opc = progImage[posLog].opc;
+					hw.mem.pos[baseFisica + off].ra  = progImage[posLog].ra;
+					hw.mem.pos[baseFisica + off].rb  = progImage[posLog].rb;
+					hw.mem.pos[baseFisica + off].p   = progImage[posLog].p;
+				}
+			}
+		}
+	}
+	// <<<<<< INSERÇÃO MÍNIMA (fim)
+
 }
