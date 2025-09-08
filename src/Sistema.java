@@ -40,6 +40,11 @@ public class Sistema {
 	// --------------------- M E M O R I A - definicoes de palavra de memoria,
 	// memória ----------------------
 
+	private boolean isSchedulerAlive() {
+  return schedThread != null && schedThread.isAlive();
+}
+
+
 	public class Memory {
 		public Word[] pos; // pos[i] é a posição i da memória. cada posição é uma palavra.
 
@@ -529,19 +534,44 @@ public class Sistema {
     //         return false; // outros erros: pare a CPU nesta versão
     //     }
     // }
+		// public boolean handle(Interrupts irpt) {
+		// 	if (irpt == Interrupts.intTimer) {
+		// 		gp.onTimeSlice();
+		// 		return gp.hasRunnable();
+		// 	} else {
+		// 		if (!continuousOn) {
+		// 			System.out.println("Interrupcao " + irpt + " no PID " + (gp != null && gp.running != null ? gp.running.pid : -1));
+		// 		}
+		// 		if (gp != null && gp.running != null) {
+		// 		gp.onProcessFault();  // finalize só o atual e despache o próximo
+		// 		return gp.hasRunnable();
+		// 		}
+		// 		return false;
+		// 	}
+		// }	
 		public boolean handle(Interrupts irpt) {
 			if (irpt == Interrupts.intTimer) {
-				gp.onTimeSlice();
-				return gp.hasRunnable();
+				gp.onTimeSlice();  // salva contexto do atual, coloca em READY e despacha o próximo
+
+				// em modo contínuo, queremos “yield” a cada fatia:
+				if (continuousOn) {
+					return false;              // faz cpu.run() sair agora
+				} else {
+					return gp.hasRunnable();   // modo batch/exec: segue rodando
+				}
+
 			} else {
-				System.out.println("Interrupcao " + irpt + " no PID " + (gp != null && gp.running != null ? gp.running.pid : -1));
+				if (!continuousOn) {
+					System.out.println("Interrupcao " + irpt + " no PID " + (gp != null && gp.running != null ? gp.running.pid : -1));
+				}
 				if (gp != null && gp.running != null) {
-				gp.onProcessFault();  // finalize só o atual e despache o próximo
-				return gp.hasRunnable();
+					gp.onProcessFault();
+					return gp.hasRunnable();
 				}
 				return false;
 			}
-	}
+		}
+
 
 }
 
@@ -555,14 +585,28 @@ public class Sistema {
     public SysCallHandling(HW _hw) { hw = _hw; }
     public void setGP(GerenteProcessos gp) { this.gp = gp; }
 
-    public boolean stop() { // STOP = fim de processo
-        System.out.println("                                               SYSCALL STOP");
-        if (gp != null) {
-            gp.onProcessStop();       // desaloca e seleciona próximo
-            return gp.hasRunnable();  // se tem outro, a CPU segue
-        }
-        return false;
-    }
+    // public boolean stop() { // STOP = fim de processo
+	// 	if (!continuousOn) {
+	// 		System.out.println("                                               SYSCALL STOP");
+	// 	}
+    //     if (gp != null) {
+    //         gp.onProcessStop();       // desaloca e seleciona próximo
+    //         return gp.hasRunnable();  // se tem outro, a CPU segue
+    //     }
+    //     return false;
+    // }
+
+	public boolean stop() {
+		if (!(continuousOn || isSchedulerAlive())) {    
+			System.out.println("                                               SYSCALL STOP");
+		}
+		if (gp != null) {
+			gp.onProcessStop();
+			return gp.hasRunnable();
+		}
+		return false;
+		}
+
 
     // public void handle() { // mantém sua lógica atual
     //     System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
@@ -574,34 +618,75 @@ public class Sistema {
     //         System.out.println("OUT:   " + v);
     //     } else { System.out.println("  PARAMETRO INVALIDO"); }
     // }
+// 	public void handle() {
+//     System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
+
+//     if (hw.cpu.reg[8] == 1) {            // READ
+//         // lê um inteiro do teclado e grava no endereço lógico passado em r9
+//         System.out.print("IN: ");
+//         int v;
+//         try {
+//             java.util.Scanner sc = new java.util.Scanner(System.in);
+//             v = sc.nextInt();
+//         } catch (Exception e) {
+//             System.out.println("Leitura inválida; usando 0.");
+//             v = 0;
+//         }
+//         int logicalAddr = hw.cpu.reg[9];
+//         if (!hw.cpu.writeMemLogicaP(logicalAddr, v)) {
+//             System.out.println("END LOGICO INVALIDO na SYSCALL READ: " + logicalAddr);
+//         }
+
+//     } else if (hw.cpu.reg[8] == 2) {     // WRITE
+//         int logicalAddr = hw.cpu.reg[9];
+//         int v = hw.cpu.readMemLogicaP(logicalAddr);
+//         System.out.println("OUT:   " + v);
+
+//     } else {
+//         System.out.println("  PARAMETRO INVALIDO");
+//     }
+// }
+
 	public void handle() {
-    System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
+		boolean quiet = (continuousOn || isSchedulerAlive());   // <-- novo
 
-    if (hw.cpu.reg[8] == 1) {            // READ
-        // lê um inteiro do teclado e grava no endereço lógico passado em r9
-        System.out.print("IN: ");
-        int v;
-        try {
-            java.util.Scanner sc = new java.util.Scanner(System.in);
-            v = sc.nextInt();
-        } catch (Exception e) {
-            System.out.println("Leitura inválida; usando 0.");
-            v = 0;
-        }
-        int logicalAddr = hw.cpu.reg[9];
-        if (!hw.cpu.writeMemLogicaP(logicalAddr, v)) {
-            System.out.println("END LOGICO INVALIDO na SYSCALL READ: " + logicalAddr);
-        }
+		if (!quiet) {
+			System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
+		}
 
-    } else if (hw.cpu.reg[8] == 2) {     // WRITE
-        int logicalAddr = hw.cpu.reg[9];
-        int v = hw.cpu.readMemLogicaP(logicalAddr);
-        System.out.println("OUT:   " + v);
+		if (hw.cpu.reg[8] == 1) {  // READ
+			int v;
+			if (quiet) {             // não bloqueia/sem log
+			v = 0;
+			} else {
+			System.out.print("IN: ");
+			try {
+				java.util.Scanner sc = new java.util.Scanner(System.in);
+				v = sc.nextInt();
+			} catch (Exception e) {
+				System.out.println("Leitura inválida; usando 0.");
+				v = 0;
+			}
+			}
+			int logicalAddr = hw.cpu.reg[9];
+			if (!hw.cpu.writeMemLogicaP(logicalAddr, v)) {
+			if (!quiet) System.out.println("END LOGICO INVALIDO na SYSCALL READ: " + logicalAddr);
+			}
 
-    } else {
-        System.out.println("  PARAMETRO INVALIDO");
-    }
-}
+		} else if (hw.cpu.reg[8] == 2) { // WRITE
+			int logicalAddr = hw.cpu.reg[9];
+			int v = hw.cpu.readMemLogicaP(logicalAddr);
+			if (!quiet) System.out.println("OUT:   " + v);
+
+		} else {
+			if (!quiet) System.out.println("  PARAMETRO INVALIDO");
+		}
+		}
+
+
+
+	
+
 
 }
 
@@ -753,23 +838,30 @@ private void loadProgramPaged(Word[] progImage) {
       return;
     }
     continuousOn = true;
+
+	gp.setTrace(false); // garante que não vai floodar
+
     schedThread = new Thread(() -> {
       System.out.println("[SCH] modo contínuo ON");
       while (continuousOn) {
         try {
-          boolean temAlgo;
-          synchronized (gp) { temAlgo = gp.hasRunnable(); }
+        boolean temAlgo = gp.hasRunnable();
+          //synchronized (gp) { temAlgo = gp.hasRunnable(); }
           if (!temAlgo) {
             Thread.sleep(20);     // ocioso: espera um pouquinho
             continue;
           }
+			gp.kick();           // <- garante o primeiro dispatch
           // Vai rodar até não haver mais processos (ou fault final)
           hw.cpu.run();
+        try { Thread.sleep(200); } catch (InterruptedException ie) { break; }
+
           // Quando cpu.run() retorna aqui, pode ter:
           // - terminado tudo (hasRunnable==false) -> volta e dorme
           // - entrado/saído processos no meio -> o loop trata
         } catch (InterruptedException ie) {
           // finalizando
+
           break;
         } catch (Throwable t) {
           t.printStackTrace();
@@ -789,9 +881,13 @@ private void loadProgramPaged(Word[] progImage) {
     }
     continuousOn = false;
     if (schedThread != null) schedThread.interrupt();
+
+	    gp.forcePauseRunning();
+
   }
 
 
+  
 
 	// >>>>>> INSERÇÃO MÍNIMA: loop interativo exigido no PDF
 // 	public void run() {
@@ -1264,6 +1360,24 @@ private void loadProgramPaged(Word[] progImage) {
 			this.utils = utils;
 			this.progs = progs;
 		}
+
+		public synchronized void forcePauseRunning() {
+			if (running != null) {
+				hw.cpu.saveContext(running);     // guarda PC e regs
+				running.state = ProcState.READY; // volta pra READY
+				readyQueue.addLast(running);     // re-enfileira
+				running = null;
+				hw.tabelaPaginasAtiva = null;    // sem processo ativo
+			}
+		}
+
+		public synchronized void kick() {
+			if (running == null) {
+				scheduleNext();
+			}
+			}
+
+
 		public synchronized void onProcessFault() {
 			PCB fin = running;
 			fin.state = ProcState.TERMINATED;
