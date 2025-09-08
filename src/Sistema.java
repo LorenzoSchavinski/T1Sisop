@@ -23,6 +23,13 @@ package src;
 
 import java.util.*;
 
+import src.Sistema.CPU;
+import src.Sistema.Interrupts;
+import src.Sistema.Memory;
+import src.Sistema.Opcode;
+import src.Sistema.PCB;
+import src.Sistema.Word;
+
 public class Sistema {
 
 	// -------------------------------------------------------------------------------------------------------
@@ -32,6 +39,11 @@ public class Sistema {
 	// -------------------------------------------------------------------------------------------------------
 	// --------------------- M E M O R I A - definicoes de palavra de memoria,
 	// memória ----------------------
+
+	private boolean isSchedulerAlive() {
+  return schedThread != null && schedThread.isAlive();
+}
+
 
 	public class Memory {
 		public Word[] pos; // pos[i] é a posição i da memória. cada posição é uma palavra.
@@ -73,9 +85,10 @@ public class Sistema {
 		SYSCALL, STOP                  // chamada de sistema e parada
 	}
 
-	public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
-		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow;
-	}
+	public enum Interrupts {           
+    noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer;
+}
+
 
 	public class CPU {
 		private int maxInt; // valores maximo e minimo para inteiros nesta cpu
@@ -100,6 +113,9 @@ public class Sistema {
 		                            // auxilio aa depuração
 		private boolean debug;      // se true entao mostra cada instrucao em execucao
 		private Utilities u;        // para debug (dump)
+
+		private int delta = 8;   // ajuste o quantum aqui
+		private int tick  = 0;
 		
 
 		public CPU(Memory _mem, boolean _debug) { // ref a MEMORIA passada na criacao da CPU
@@ -111,6 +127,28 @@ public class Sistema {
 			debug = _debug;            // se true, print da instrucao em execucao
 
 		}
+
+
+
+
+
+		public void setTimerDelta(int d) { this.delta = Math.max(1, d); }
+		public void resetTicks() { this.tick = 0; }
+
+		// ----- CONTEXTO para PCB -----
+		public void saveContext(PCB pcb) {
+			pcb.pcLogico = this.pc;
+			System.arraycopy(this.reg, 0, pcb.regs, 0, this.reg.length);
+		}
+		public void loadContext(PCB pcb) {
+			this.pc = pcb.pcLogico;
+			System.arraycopy(pcb.regs, 0, this.reg, 0, this.reg.length);
+			irpt = Interrupts.noInterrupt;
+			resetTicks();
+		}
+		// ------------------------------
+
+		public void setDebug(boolean d) { this.debug = d; }
 
 		private int tamPg() { return u.hw.gm.getTamPg(); } // usa GM
 		private int traduz(int enderecoLogico) {
@@ -136,9 +174,17 @@ public class Sistema {
 			return enderecoFisico;
 		}
 		public int readMemLogicaP(int e) {
-		Word w = lerMemLogica(e);   // usa MMU
-		return (w != null) ? w.p : 0;
+			Word w = lerMemLogica(e);   // usa MMU
+			return (w != null) ? w.p : 0;
 		}
+		public boolean writeMemLogicaP(int e, int valor) {
+			if (legalLogico(e)) {
+				escreverMemLogica(e, valor);
+				return true;
+			}
+			return false;
+		}
+
 
 
 		private boolean legalLogico(int e) {
@@ -157,7 +203,7 @@ public class Sistema {
 			m[ef].opc = Opcode.DATA;
 			m[ef].p   = valor;
 		}
-		// --- FIM MMU/Tradução ---
+	
 
 
 		public void setAddressOfHandlers(InterruptHandling _ih, SysCallHandling _sysCall) {
@@ -202,7 +248,6 @@ public class Sistema {
 			while (!cpuStop) {      // ciclo de instrucoes. acaba cfe resultado da exec da instrucao, veja cada caso.
 
 				// --------------------------------------------------------------------------------------------------
-				// FASE DE FETCH
 				if (legalLogico(pc)) {
     			ir = lerMemLogica(pc); // busca via tradução
 					             // resto é dump de debug
@@ -219,9 +264,7 @@ public class Sistema {
 						u.dump(ir);
 					}
 
-				// --------------------------------------------------------------------------------------------------
-				// FASE DE EXECUCAO DA INSTRUCAO CARREGADA NO ir
-					switch (ir.opc) {       // conforme o opcode (código de operação) executa
+					switch (ir.opc) {       // conforme o opcode executa
 
 						// Instrucoes de Busca e Armazenamento em Memoria
 						case LDI: // Rd ← k        veja a tabela de instrucoes do HW simulado para entender a semantica da instrucao
@@ -342,7 +385,6 @@ public class Sistema {
 							}
 							break;
 						case JMPIGM: // If RC > 0 then PC <- [A] else PC++
-						// ANTES: if (legal(ir.p)) { if (reg[ir.rb] > 0) pc = m[ir.p].p; else pc++; }
 						if (legalLogico(ir.p)) {
 							if (reg[ir.rb] > 0) {
 								pc = lerMemLogica(ir.p).p;
@@ -352,7 +394,6 @@ public class Sistema {
 						}
 						break;
 						case JMPILM: // If RC < 0 then PC <- [A] else PC++
-						// ANTES: if (reg[ir.rb] < 0) { pc = m[ir.p].p; } else { pc++; }
 						if (legalLogico(ir.p)) {
 							if (reg[ir.rb] < 0) {
 								pc = lerMemLogica(ir.p).p;
@@ -362,7 +403,6 @@ public class Sistema {
 						}
 						break;
 						case JMPIEM: // If RC = 0 then PC <- [A] else PC++
-						// ANTES: if (reg[ir.rb] == 0) { pc = m[ir.p].p; } else { pc++; }
 						if (legalLogico(ir.p)) {
 							if (reg[ir.rb] == 0) {
 								pc = lerMemLogica(ir.p).p;
@@ -391,8 +431,9 @@ public class Sistema {
 							break;
 
 						case STOP: // por enquanto, para execucao
-							sysCall.stop();
-							cpuStop = true;
+							if (!sysCall.stop()) {  // stop() agora devolve boolean
+								cpuStop = true;     // false = não há mais quem rodar, pode parar a CPU
+							}
 							break;
 
 						// Inexistente
@@ -400,13 +441,26 @@ public class Sistema {
 							irpt = Interrupts.intInstrucaoInvalida;
 							break;
 					}
+					// TIMER: após a instrução executar com sucesso
+						if (irpt == Interrupts.noInterrupt) {
+							if (++tick >= delta) {
+								irpt = Interrupts.intTimer;
+								tick = 0;
+							}
+						}
+
 				}
 				// --------------------------------------------------------------------------------------------------
 				// VERIFICA INTERRUPÇÃO !!! - TERCEIRA FASE DO CICLO DE INSTRUÇÕES
 				if (irpt != Interrupts.noInterrupt) { // existe interrupção
-					ih.handle(irpt);                  // desvia para rotina de tratamento - esta rotina é do SO
-					cpuStop = true;                   // nesta versao, para a CPU
+					boolean keepRunning = ih.handle(irpt); // handler agora retorna se a CPU deve continuar
+					irpt = Interrupts.noInterrupt;
+					if (!keepRunning) {
+						cpuStop = true; // faults param; timer pode continuar sem parar
+					}
 				}
+
+
 			} // FIM DO CICLO DE UMA INSTRUÇÃO
 		}
 	}
@@ -446,49 +500,99 @@ public class Sistema {
 	// ------------------- I N T E R R U P C O E S - rotinas de tratamento
 	// ----------------------------------
 	public class InterruptHandling {
-		private HW hw; // referencia ao hw se tiver que setar algo
+    private HW hw;
+    private GerenteProcessos gp; // setado depois
 
-		public InterruptHandling(HW _hw) {
-			hw = _hw;
+    public InterruptHandling(HW _hw) { hw = _hw; }
+    public void setGP(GerenteProcessos gp) { this.gp = gp; }
+
+   
+		public boolean handle(Interrupts irpt) {
+			if (irpt == Interrupts.intTimer) {
+				gp.onTimeSlice();  // salva contexto do atual, coloca em READY e mete o proximo
+
+				
+				if (continuousOn) {
+					return false;              // faz cpu.run() sair agora
+				} else {
+					return gp.hasRunnable();   // modo batch/exec: segue rodando
+				}
+
+			} else {
+				if (!continuousOn) {
+					System.out.println("Interrupcao " + irpt + " no PID " + (gp != null && gp.running != null ? gp.running.pid : -1));
+				}
+				if (gp != null && gp.running != null) {
+					gp.onProcessFault();
+					return gp.hasRunnable();
+				}
+				return false;
+			}
 		}
 
-		public void handle(Interrupts irpt) {
-			// apenas avisa - todas interrupcoes neste momento finalizam o programa
-			System.out.println(
-					"                                               Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
-		}
-	}
+
+}
+
 
 	// ------------------- C H A M A D A S D E S I S T E M A - rotinas de tratamento
 	// ----------------------
 	public class SysCallHandling {
-		private HW hw; // referencia ao hw se tiver que setar algo
+    private HW hw;
+    private GerenteProcessos gp; // setado depois
 
-		public SysCallHandling(HW _hw) {
-			hw = _hw;
-		}
+    public SysCallHandling(HW _hw) { hw = _hw; }
+    public void setGP(GerenteProcessos gp) { this.gp = gp; }
 
-		public void stop() { // chamada de sistema indicando final de programa
-							 // nesta versao cpu simplesmente pára
+	public boolean stop() {
+		if (!(continuousOn || isSchedulerAlive())) {    
 			System.out.println("                                               SYSCALL STOP");
 		}
-
-		public void handle() { // chamada de sistema 
-			                   // suporta somente IO, com parametros 
-							   // reg[8] = in ou out    e reg[9] endereco do inteiro
-			System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
-
-			if  (hw.cpu.reg[8]==1){
-				  // leitura ...
-
-			} else if (hw.cpu.reg[8]==2){
-				  // saída: lê endereço LÓGICO reg[9] via MMU
-				int logicalAddr = hw.cpu.reg[9];
-				int v = hw.cpu.readMemLogicaP(logicalAddr);
-				System.out.println("OUT:   " + v);
-			} else {System.out.println("  PARAMETRO INVALIDO"); }		
+		if (gp != null) {
+			gp.onProcessStop();
+			return gp.hasRunnable();
 		}
-	}
+		return false;
+		}
+
+	public void handle() {
+		boolean quiet = (continuousOn || isSchedulerAlive());   
+
+		if (!quiet) {
+			System.out.println("SYSCALL pars:  " + hw.cpu.reg[8] + " / " + hw.cpu.reg[9]);
+		}
+
+		if (hw.cpu.reg[8] == 1) {  // READ
+			int v;
+			if (quiet) {             // não bloqueia/sem log
+			v = 0;
+			} else {
+			System.out.print("IN: ");
+			try {
+				java.util.Scanner sc = new java.util.Scanner(System.in);
+				v = sc.nextInt();
+			} catch (Exception e) {
+				System.out.println("Leitura inválida; usando 0.");
+				v = 0;
+			}
+			}
+			int logicalAddr = hw.cpu.reg[9];
+			if (!hw.cpu.writeMemLogicaP(logicalAddr, v)) {
+			if (!quiet) System.out.println("END LOGICO INVALIDO na SYSCALL READ: " + logicalAddr);
+			}
+
+		} else if (hw.cpu.reg[8] == 2) { // WRITE
+			int logicalAddr = hw.cpu.reg[9];
+			int v = hw.cpu.readMemLogicaP(logicalAddr);
+			if (!quiet) System.out.println("OUT:   " + v);
+
+		} else {
+			if (!quiet) System.out.println("  PARAMETRO INVALIDO");
+		}
+		}
+
+
+}
+
 
 	// ------------------ U T I L I T A R I O S D O S I S T E M A
 	// -----------------------------------------
@@ -502,7 +606,6 @@ public class Sistema {
 			hw = _hw;
 		}
 
-		
 		private void loadProgram(Word[] p) {
 			Word[] m = hw.mem.pos; // m[] é o array de posições memória do hw
 			for (int i = 0; i < p.length; i++) {
@@ -513,7 +616,6 @@ public class Sistema {
 			}
 		}
 
-	// dentro de Utilities (mesma classe do loadProgram original)
 private void loadProgramPaged(Word[] progImage) {
     int tamProg = progImage.length;
     int[] tabela = hw.gm.aloca(tamProg);
@@ -521,7 +623,7 @@ private void loadProgramPaged(Word[] progImage) {
         System.out.println("Sem memória (frames) para alocar programa.");
         return;
     }
-    hw.tabelaPaginasAtiva = tabela; // Parte A: uma única tabela “global”
+    hw.tabelaPaginasAtiva = tabela; 
 
 	System.out.println("Frames alocados: " + java.util.Arrays.toString(hw.tabelaPaginasAtiva));
     System.out.println("tamPg = " + hw.gm.getTamPg() + "  |  páginas = " + tabela.length);
@@ -532,7 +634,7 @@ private void loadProgramPaged(Word[] progImage) {
         int frame = tabela[p];
         int baseFisica = frame * tamPg;
         for (int off = 0; off < tamPg && posLogica < tamProg; off++, posLogica++) {
-            // copia a “imagem lógica” para o frame físico correto
+            // copia a “imagem lgoica” para o frame físico correto
             hw.mem.pos[baseFisica + off].opc = progImage[posLogica].opc;
             hw.mem.pos[baseFisica + off].ra  = progImage[posLogica].ra;
             hw.mem.pos[baseFisica + off].rb  = progImage[posLogica].rb;
@@ -546,7 +648,7 @@ private void loadProgramPaged(Word[] progImage) {
 		
 
 		// dump da memória
-		public void dump(Word w) { // funcoes de DUMP nao existem em hardware - colocadas aqui para facilidade
+		public void dump(Word w) { 
 			System.out.print("[ ");
 			System.out.print(w.opc);
 			System.out.print(", ");
@@ -567,22 +669,9 @@ private void loadProgramPaged(Word[] progImage) {
 			}
 		}
 
-		// private void loadAndExec(Word[] p) {
-		// 	loadProgram(p); // carga do programa na memoria
-		// 	System.out.println("---------------------------------- programa carregado na memoria");
-		// 	dump(0, p.length); // dump da memoria nestas posicoes
-		// 	hw.cpu.setContext(0); // seta pc para endereço 0 - ponto de entrada dos programas
-		// 	System.out.println("---------------------------------- inicia execucao ");
-		// 	hw.cpu.run(); // cpu roda programa ate parar
-		// 	System.out.println("---------------------------------- memoria após execucao ");
-		// 	dump(0, p.length); // dump da memoria com resultado
-		// }
-
 		private void loadAndExec(Word[] p) {
-		loadProgramPaged(p);                      // <<< troque para a versão paginada
+		loadProgramPaged(p);                     
 		System.out.println("---------------------------------- programa carregado na memoria");
-		// dump físico contínuo deixa de fazer sentido; pode manter só para inspeção
-		// hw.cpu.setContext(0);  // já é feito no loadProgramPaged
 		System.out.println("---------------------------------- inicia execucao ");
 		hw.cpu.run();
 		System.out.println("---------------------------------- fim da execucao ");
@@ -611,26 +700,143 @@ private void loadProgramPaged(Word[] progImage) {
 	public SO so;
 	public Programs progs;
 
+	
+	public GerenteProcessos gp;
+
+
 	public Sistema(int tamMem) {
 		hw = new HW(tamMem);           // memoria do HW tem tamMem palavras
 		so = new SO(hw);
 		hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
 		progs = new Programs();
+		gp = new GerenteProcessos(hw, so.utils, progs);
+		so.ih.setGP(gp);
+		so.sc.setGP(gp);
+
+		
 	}
+
+	private Thread schedThread;
+  private volatile boolean continuousOn = false;
+
+  private void startContinuous() {
+    if (schedThread != null && schedThread.isAlive()) {
+      System.out.println("[SCH] modo contínuo já está ON");
+      return;
+    }
+    continuousOn = true;
+
+	gp.setTrace(false); // garante traceOff pra nao floodar o temrinal
+
+    schedThread = new Thread(() -> {
+      System.out.println("[SCH] modo contínuo ON");
+      while (continuousOn) {
+        try {
+        boolean temAlgo = gp.hasRunnable();
+          if (!temAlgo) {
+            Thread.sleep(20);     // espera um pouquinho
+            continue;
+          }
+			gp.kick();           // garante o primeiro dispatch
+          // Vai rodar até não haver mais processos
+          hw.cpu.run();
+        try { Thread.sleep(200); } catch (InterruptedException ie) { break; } //tempo pra ver no terminal o running se nao ele acaba mtn rapido
+
+         
+        } catch (InterruptedException ie) {
+
+          break;
+        } catch (Throwable t) {
+          t.printStackTrace();
+        }
+      }
+      System.out.println("[SCH] modo contínuo OFF");
+    });
+    schedThread.setDaemon(true);
+    schedThread.start();
+  }
+
+  private void stopContinuous() {
+    if (!continuousOn) {
+      System.out.println("[SCH] modo contínuo já está OFF");
+      return;
+    }
+    continuousOn = false;
+    if (schedThread != null) schedThread.interrupt();
+
+	    gp.forcePauseRunning();
+
+  }
 
 	public void run() {
+	System.out.println("SO pronto. Comandos: new <prog> | rm <pid> | ps | dump <pid> | dumpM <ini> <fim> | exec <pid> | execAll | traceOn | traceOff | go | halt | exit");
+	Scanner sc = new Scanner(System.in);
+	while (true) {
+		System.out.print("> ");
+		if (!sc.hasNext()) break;
+		String cmd = sc.next();
 
-		so.utils.loadAndExec(progs.retrieveProgram("fatorialV2"));
+		if (cmd.equalsIgnoreCase("new")) {
+		String prog = sc.next();
+		gp.newProcess(prog);           // em modo contínuo, o timer preempta e pega sozinho
 
-		// so.utils.loadAndExec(progs.retrieveProgram("fatorial"));
-		// fibonacci10,
-		// fibonacci10v2,
-		// progMinimo,
-		// fatorialWRITE, // saida
-		// fibonacciREAD, // entrada
-		// PB
-		// PC, // bubble sort
+		} else if (cmd.equalsIgnoreCase("rm")) {
+		int pid = sc.nextInt();
+		gp.rm(pid);
+
+		} else if (cmd.equalsIgnoreCase("ps")) {
+		gp.ps();
+
+		} else if (cmd.equalsIgnoreCase("dump")) {
+		int pid = sc.nextInt();
+		gp.dump(pid);
+
+		} else if (cmd.equalsIgnoreCase("dumpM")) {
+		int ini = sc.nextInt();
+		int fim = sc.nextInt();
+		gp.dumpM(ini, fim);
+
+		} else if (cmd.equalsIgnoreCase("exec")) {
+		int pid = sc.nextInt();
+		if (continuousOn) {
+			System.out.println("[WARN] Modo contínuo ON: ignore 'exec'. O escalonador já está rodando.");
+		} else {
+			gp.exec(pid); // modo batch: bloqueia ate pausar/terminar
+		}
+
+		} else if (cmd.equalsIgnoreCase("execAll")) {
+		if (continuousOn) {
+			System.out.println("[WARN] Modo contínuo ON: ignore 'execAll'. Use 'halt' para voltar ao modo batch.");
+		} else {
+			gp.execAll();  // roda tudo e volta
+		}
+
+		} else if (cmd.equalsIgnoreCase("traceOn")) {
+		gp.setTrace(true);
+
+		} else if (cmd.equalsIgnoreCase("traceOff")) {
+		gp.setTrace(false);
+
+		} else if (cmd.equalsIgnoreCase("go")) {
+		startContinuous();
+
+		} else if (cmd.equalsIgnoreCase("halt")) {
+		stopContinuous();
+
+		} else if (cmd.equalsIgnoreCase("exit")) {
+		stopContinuous();   // garante desligar a thread
+		System.out.println("Encerrando SO.");
+		break;
+
+		} else {
+		System.out.println("Comando inválido.");
+		sc.nextLine();
+		}
 	}
+	sc.close();
+	}
+
+
 	// ------------------- S I S T E M A - fim
 	// --------------------------------------------------------------
 	// -------------------------------------------------------------------------------------------------------
@@ -663,7 +869,7 @@ private void loadProgramPaged(Word[] progImage) {
 
 		public Word[] retrieveProgram(String pname) {
 			for (Program p : progs) {
-				if (p != null & p.name == pname)
+				if (p != null && p.name.equals(pname))
 					return p.image;
 			}
 			return null;
@@ -951,4 +1157,249 @@ private void loadProgramPaged(Word[] progImage) {
 						})
 		};
 	}
+
+	public enum ProcState { NEW, READY, RUNNING, TERMINATED }
+
+	public class PCB {
+    public final int pid;
+    public final String name;
+    public ProcState state;
+    public int pcLogico;          // PC logico
+    public int[] tabelaPaginas;   // page -> frame
+    public int tamProg;           // numero de palavras do programa
+    public int[] regs = new int[10]; 
+
+    public PCB(int pid, String name, int[] tabela, int tamProg) {
+        this.pid = pid;
+        this.name = name;
+        this.tabelaPaginas = tabela;
+        this.tamProg = tamProg;
+        this.pcLogico = 0;
+        this.state = ProcState.NEW;
+    }
+}
+
+
+	public class GerenteProcessos {
+		private final HW hw;
+		private final Utilities utils;
+		private final Programs progs;
+		private int nextPid = 1;
+
+		private final Map<Integer, PCB> procTable = new HashMap<>();
+		private final Deque<PCB> readyQueue = new ArrayDeque<>();
+		private PCB running = null;
+
+		public GerenteProcessos(HW hw, Utilities utils, Programs progs) {
+			this.hw = hw;
+			this.utils = utils;
+			this.progs = progs;
+		}
+
+		public synchronized void forcePauseRunning() {
+			if (running != null) {
+				hw.cpu.saveContext(running);     // guarda PC e regs
+				running.state = ProcState.READY; // volta pra READY
+				readyQueue.addLast(running);     // re-enfileira
+				running = null;
+				hw.tabelaPaginasAtiva = null;    // sem processo ativo
+			}
+		}
+
+		public synchronized void kick() {
+			if (running == null) {
+				scheduleNext();
+			}
+			}
+
+
+		public synchronized void onProcessFault() {
+			PCB fin = running;
+			fin.state = ProcState.TERMINATED;
+			hw.gm.desaloca(fin.tabelaPaginas);
+			procTable.remove(fin.pid);
+			running = null;
+			scheduleNext();
+			}
+
+		public synchronized void onTimeSlice() {
+			if (running == null) return;
+			hw.cpu.saveContext(running);
+			running.state = ProcState.READY;
+			readyQueue.addLast(running);
+			scheduleNext();
+		}
+
+		public synchronized void onProcessStop() {
+			if (running == null) return;
+			PCB fin = running;
+			fin.state = ProcState.TERMINATED;
+			hw.gm.desaloca(fin.tabelaPaginas);
+			procTable.remove(fin.pid);
+			running = null;
+			scheduleNext();
+		}
+
+		public synchronized boolean hasRunnable() {
+			return running != null || !readyQueue.isEmpty();
+		}
+
+		private synchronized void dispatch(PCB pcb) {
+			running = pcb;
+			running.state = ProcState.RUNNING;
+			hw.tabelaPaginasAtiva = running.tabelaPaginas;
+			hw.cpu.loadContext(running);
+		}
+		private synchronized void scheduleNext() {
+			PCB next = readyQueue.pollFirst();
+			if (next != null) {
+				dispatch(next);
+			} else {
+				hw.tabelaPaginasAtiva = null;
+				running = null;
+			}
+		}
+
+
+		// new nome do pgrograma
+		public synchronized int newProcess(String progName) {
+			Word[] image = progs.retrieveProgram(progName);
+			if (image == null) {
+				System.out.println("Programa não encontrado: " + progName);
+				return -1;
+			}
+			int tamProg = image.length;
+
+			//  reserva espaço logico até 100.
+			int tamLogico = Math.max(tamProg, 100);
+			int[] tabela = hw.gm.aloca(tamLogico);
+			if (tabela == null) {
+				System.out.println("Sem memória (frames) para alocar: " + progName);
+				return -1;
+			}
+
+			copyProgramToFrames(tabela, image);
+
+			int pid = nextPid++;
+			PCB pcb = new PCB(pid, progName, tabela, tamProg);
+			pcb.state = ProcState.READY;
+			procTable.put(pid, pcb);
+			readyQueue.addLast(pcb);
+
+			System.out.println("Processo criado: PID=" + pid + "  Prog=" + progName +
+					"  Pags=" + tabela.length + "  Frames=" + java.util.Arrays.toString(tabela));
+			return pid;
+		}
+
+		// rm id do programa
+		public synchronized boolean rm(int pid) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) {
+				System.out.println("PID inexistente: " + pid);
+				return false;
+			}
+			if (running != null && running.pid == pid) {
+				System.out.println("PID " + pid + " está rodando; finalize antes de remover.");
+				return false;
+			}
+			readyQueue.removeIf(p -> p.pid == pid);
+			hw.gm.desaloca(pcb.tabelaPaginas);
+			procTable.remove(pid);
+			System.out.println("Processo removido: PID=" + pid + " (" + pcb.name + ")");
+			return true;
+		}
+
+		// ps
+		public synchronized void ps() {
+			if (procTable.isEmpty()) {
+				System.out.println("(sem processos)");
+				return;
+			}
+			System.out.println(String.format("%-5s %-14s %-10s %-6s %-18s", "PID", "PROGRAMA", "ESTADO", "PC", "PAGS(frames)"));
+			for (PCB p : procTable.values()) {
+				System.out.println(String.format("%-5d %-14s %-10s %-6d %s",
+						p.pid, p.name, p.state, p.pcLogico, java.util.Arrays.toString(p.tabelaPaginas)));
+			}
+			if (running != null) {
+				System.out.println("Running: PID=" + running.pid);
+			}
+			if (!readyQueue.isEmpty()) {
+				System.out.print("ReadyQueue: ");
+				readyQueue.forEach(p -> System.out.print(p.pid + " "));
+				System.out.println();
+			}
+		}
+
+		// dump id do programa
+		public synchronized void dump(int pid) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) {
+				System.out.println("PID inexistente: " + pid);
+				return;
+			}
+			System.out.println("PCB { pid=" + pcb.pid + ", name=" + pcb.name + ", state=" + pcb.state +
+					", pcLogico=" + pcb.pcLogico + ", tamProg=" + pcb.tamProg + ", tabela=" +
+					java.util.Arrays.toString(pcb.tabelaPaginas) + " }");
+
+			int tamPg = hw.gm.getTamPg();
+			System.out.println("Dump memória física por frame:");
+			for (int frame : pcb.tabelaPaginas) {
+				int base = frame * tamPg;
+				System.out.println("Frame " + frame + " (físico " + base + " .. " + (base + tamPg - 1) + "):");
+				utils.dump(base, base + tamPg);
+			}
+		}
+
+		// dumpM inicio fim
+		public synchronized void dumpM(int ini, int fim) {
+			utils.dump(ini, fim);
+		}
+
+		// exec id do programa
+		public synchronized boolean exec(int pid) {
+			PCB pcb = procTable.get(pid);
+			if (pcb == null) { System.out.println("PID inexistente: " + pid); return false; }
+			if (running != null) { System.out.println("Já existe processo rodando: PID=" + running.pid); return false; }
+			readyQueue.removeIf(p -> p.pid == pid);
+
+			dispatch(pcb);
+			System.out.println("---------------------------------- inicia execucao PID=" + pid);
+			hw.cpu.run(); // timer/stop mudarão o running e continuarão via handlers
+			System.out.println("---------------------------------- pausa/termino PID=" + pid);
+			return true;
+		}
+		public synchronized void execAll() {
+			while (hasRunnable()) {
+				if (running == null) scheduleNext();
+				if (running == null) break;
+				hw.cpu.run();
+			}
+			System.out.println("[execAll] Todos os processos finalizaram ou foram removidos.");
+		}
+
+
+
+		// traceOn / traceOff
+		public synchronized void setTrace(boolean on) {
+			hw.cpu.setDebug(on);
+			System.out.println("Trace " + (on ? "ON" : "OFF"));
+		}
+
+		// copia a imagem logica do programa para os frames fisicos alocados
+		private void copyProgramToFrames(int[] tabela, Word[] progImage) {
+			int tamPg = hw.gm.getTamPg();
+			int posLog = 0;
+			for (int p = 0; p < tabela.length; p++) {
+				int frame = tabela[p];
+				int baseFisica = frame * tamPg;
+				for (int off = 0; off < tamPg && posLog < progImage.length; off++, posLog++) {
+					hw.mem.pos[baseFisica + off].opc = progImage[posLog].opc;
+					hw.mem.pos[baseFisica + off].ra  = progImage[posLog].ra;
+					hw.mem.pos[baseFisica + off].rb  = progImage[posLog].rb;
+					hw.mem.pos[baseFisica + off].p   = progImage[posLog].p;
+				}
+			}
+		}
+	}
+
 }
